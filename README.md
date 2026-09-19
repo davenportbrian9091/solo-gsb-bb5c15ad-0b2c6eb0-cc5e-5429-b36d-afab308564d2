@@ -124,6 +124,65 @@ curl -X POST http://localhost:8000/api/v1/ion-envelope \
   -d '{"formula":"C6H12O6","adduct":"+Na-H","charge":1,"top_n":5}'
 ```
 
+### `POST /api/v1/neutral-profile`
+
+将**中性分子的同位素棒谱**（stick spectrum）与**仪器轮廓**（instrument profile）卷积，模拟连续质量轴上的高斯展宽谱线。先复用 `/api/v1/envelope` 的分子式解析与多项式卷积得到全部同位素棒（不做 `top_n` 截断），再为每根质量为 m 的棒生成以该质量为中心的高斯核：
+
+```
+FWHM(m) = m / resolving_power
+σ       = FWHM / (2√(2 ln 2))
+```
+
+每个核仅在棒质量的 **±4σ** 内采样，并累加到**统一质量网格**（间距 `mass_step`，单位 Da）；落在请求区间外的核被截断，但区间内的贡献原样保留（不做截断后归一化）。全部核累加完成后，将最高强度归一化为 **100**，按质量升序返回整条 profile。
+
+请求体：
+
+```json
+{
+  "formula": "C6H12O6",
+  "resolving_power": 100000,
+  "mass_step": 0.001,
+  "mass_min": 180.0,
+  "mass_max": 190.0
+}
+```
+
+- `formula`（必填）：中性分子式，规则同 `/api/v1/envelope`（可含 `[13C]` 等纯同位素标记）。
+- `resolving_power`（必填，>0）：仪器分辨率 R = m/FWHM；不同质量的棒按各自 FWHM = m/R 展宽（质量越大峰越宽）。
+- `mass_step`（必填，>0）：输出统一质量网格的间距（Da）。
+- `mass_min` / `mass_max`（可选，>0）：输出质量区间（Da，闭区间）。**两者均可省略**：
+  - 都省略：区间取**所有棒峰各自 ±4σ 支撑窗的并集**边界（最小下界、最大上界）；
+  - 只给一个：另一个边界取上述并集边界；
+  - 网格必须为非空区间（`mass_min < mass_max`），且总点数 **最多 20000**（点数 = `floor((mass_max − mass_min)/mass_step) + 1`），否则返回 422。
+
+响应：
+
+```json
+{
+  "formula": "C6H12O6",
+  "resolving_power": 100000.0,
+  "mass_min": 180.0,
+  "mass_max": 190.0,
+  "mass_step": 0.001,
+  "point_count": 10001,
+  "profile": [
+    {"mass": 180.0, "intensity": 2.315421},
+    {"mass": 180.001, "intensity": 2.453812}
+  ]
+}
+```
+
+- `mass_min` / `mass_max`：实际使用的区间（省略时回填为 ±4σ 并集边界）。
+- `point_count`：统一网格点数（`len(profile)`），上限 20000。
+- `profile`：`mass` 从 `mass_min` 起按 `mass_step` 等间距递增、最高强度归一化为 100 的连续轮廓；区间外的高斯核被截断、区间内贡献保留，因此区间边缘的峰可能因截断而矮于 100。
+- 区间内没有任何网格点落入任一根棒的 ±4σ 支撑窗时（如窗口离谱图太远，或窗口窄于一个步长）返回 422。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/neutral-profile \
+  -H 'Content-Type: application/json' \
+  -d '{"formula":"C6H12O6","resolving_power":100000,"mass_step":0.001}'
+```
+
 ### `POST /api/v1/ion-identify`
 
 在一个中性分子式上同时评估 **1～20 个候选加合物/电荷组合**：对每个候选复用 `/api/v1/ion-envelope` 的加合物解析与离子包络计算（含 `|charge| ×` 合并容差缩放与 m/z 换算、基峰归一化为 100），将预测 m/z 峰与观测 m/z 峰在容差内一对一配对，以全部配对（含未匹配峰）的强度均方误差对候选排序，返回全部候选的得分、配对明细与最佳候选。
@@ -489,7 +548,22 @@ curl -X POST http://localhost:8000/api/v1/ion-mixture-fit \
 - `invalid_label`：标签非法——格式错误（应为 `13C` 形式）、未知元素符号、未知质量数（`position` 为标签字符串中的 0 基字符位置）。
 - `invalid_labels`：双标签组合非法——两个标签属于同一元素（`index` 为标签列表中出错标签的 0 基索引）。
 - `invalid_peaks`：观测峰列表为空、质量非递增或重复（`index` 为出错峰的 0 基索引，空列表时为 `null`）。
-- 参数越界（`step_percent` 超出 0.5～10、`mass_tolerance` 非正、`labels` 不是恰好两个、峰数超过 200、强度为负等）由请求校验返回标准 422 并指明字段位置。
+- `invalid_mass_step`：`/api/v1/neutral-profile` 的 `mass_step` 非正（Pydantic 字段校验同样会拦截 0/负数并指明 `field`）。
+- `invalid_mass_range`：`/api/v1/neutral-profile` 的质量区间为空或反向（`mass_min ≥ mass_max`，含单侧给定时与自动 ±4σ 边界比较的情形）；`field` 为 `mass_min`。
+- `grid_too_large`：统一网格点数超过 20000（放宽 `mass_step` 或缩窄质量区间）；`field` 为 `mass_step`。
+- `no_profile_points`：区间内没有任何网格点落入任一棒峰的 ±4σ 支撑窗（窗口离谱图太远或窄于一个步长）；`field` 为 `mass_min`。
+
+  ```json
+  {
+    "detail": {
+      "error": "grid_too_large",
+      "message": "Mass grid would contain 25001 points; at most 20000 are allowed (widen mass_step or narrow the mass range)",
+      "field": "mass_step"
+    }
+  }
+  ```
+
+- 参数越界（`step_percent` 超出 0.5～10、`mass_tolerance` 非正、`labels` 不是恰好两个、峰数超过 200、强度为负、`resolving_power`/`mass_step` 非正、`mass_min`/`mass_max` 为 0 或非有限值等）由请求校验返回标准 422 并指明字段位置。
 
 ### 其他端点
 
@@ -521,6 +595,7 @@ pytest                                 # 运行测试
 - **多项式卷积**：每种元素的同位素模式表示为多项式 `Σ aᵢ·x^mᵢ`（丰度 × 质量的幂），分子包络为各元素多项式（按原子数取幂，使用快速幂）之积；多项式乘法即 (质量, 强度) 峰列表的卷积。纯同位素标记贡献固定质量位移。
 - **峰合并**：排序后相邻质量差 < 0.0001 Da 的峰融合为一个，质量取强度加权平均，强度取和。
 - **离子包络**：`POST /api/v1/ion-envelope` 将加合物（`app/adduct.py`，形如 `+2H-H2O` 的连续片段，系数乘整个片段）施加到解析后的原子计数上，用 `|charge| × MSPC_MERGE_TOLERANCE` 的中性质量容差卷积，再按 `(mass − charge·mₑ)/|charge|`（`mₑ = 0.000548579909065 Da`）逐峰换算为 m/z。
+- **仪器轮廓模拟**：`POST /api/v1/neutral-profile`（`app/profile.py`）复用中性包络卷积得到全部棒峰，对每根质量 m 的棒构造 `FWHM = m/resolving_power`、`σ = FWHM/(2√(2 ln 2))` 的高斯核，只在 ±4σ 内逐点累加到同一张等间距网格（`mass_step`），区间外的核截断、区间内贡献原样保留，再将全图基峰归一化为 100。省略范围时取所有棒 ±4σ 支撑窗的并集；网格点数超过 20000、区间为空/反向、步长非正或区间内无有效采样点均返回带 `field` 的 422。
 - **离子识别**：`POST /api/v1/ion-identify`（`app/identify.py`）对 1～20 个候选（加合物, 电荷）逐个复用同一套加合物解析、离子包络计算与基峰归一化，观测峰同样归一化一次后复用；每个候选用与富集拟合相同的 `pair_and_score` 做容差内质量差全局从小到大的一对一贪心匹配，未匹配峰以零强度计入归一化 MSE。有效候选按 MSE 升序、输入索引作稳定平局键排序；非法候选捕获既有 `AdductError`（携带位置）后以 `valid: false` 附在结果末尾，不影响其他候选评分。
 - **离子混合拟合**：`POST /api/v1/ion-mixture-fit`（`app/mixture.py`）对 2～10 个候选中的每个有效候选复用 `app/identify.py` 的基峰归一化离子包络；枚举无序候选对（按请求索引升序，索引较小者为第一候选）与 0～100% 的第一候选比例网格（复用富集拟合的 `abundance_grid`，100% 端点始终包含），将两个归一化包络按比例加权叠加——两包络间 `mass_tolerance` 内的峰按强度加权质量融合、强度求和（复用 `merge_peaks`；比例为 0%/100% 时跳过另一侧，即纯包络）——混合谱再次基峰归一化后与观测峰做同一套 `pair_and_score` 一对一配对，双侧未匹配峰以零强度计入 MSE。全部组合按 (MSE, 候选索引对, 第一候选比例) 升序排名，首名即最佳组合（平局依次取较小索引对、较低首候选比例）；非法候选以 `valid: false` 返回既有位置错误并跳过其所有组合，有效候选少于两个时组合列表为空、最佳组合为 `null`。
 - **单同位素质量**：按 IUPAC 惯例取各元素天然丰度最高的同位素质量之和。

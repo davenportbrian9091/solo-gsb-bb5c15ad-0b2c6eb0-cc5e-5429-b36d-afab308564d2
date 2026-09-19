@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -30,6 +31,7 @@ from .identify import IonCandidatePrediction, predict_ion_candidate, score_ion_c
 from .isotopes import ISOTOPES
 from .mixture import fit_ion_mixture, score_mixture
 from .parser import FormulaError, LabelError, parse_formula, parse_label
+from .profile import ProfileParameterError, simulate_profile
 
 
 @asynccontextmanager
@@ -50,8 +52,9 @@ app = FastAPI(
         "formulas, with optional pure-isotope labels such as [13C]; also "
         "estimates single-isotope enrichment by fitting candidate "
         "abundances against observed peaks, jointly fits two isotopes of "
-        "different elements on a 2-D abundance grid, and fits pairwise "
-        "0-100% mixtures of candidate adduct/charge ion envelopes."
+        "different elements on a 2-D abundance grid, fits pairwise "
+        "0-100% mixtures of candidate adduct/charge ion envelopes, and "
+        "simulates Gaussian instrument profiles of neutral stick spectra."
     ),
     lifespan=lifespan,
 )
@@ -139,6 +142,67 @@ class IonEnvelopeResponse(BaseModel):
     base_peak_intensity: float
     peak_count: int
     peaks: list[MzPeakOut]
+
+
+class NeutralProfileRequest(BaseModel):
+    formula: str = Field(
+        ...,
+        description="Neutral molecular formula, e.g. 'C6H12O6' or 'C6H6[13C]2'",
+        examples=["C6H12O6"],
+    )
+    resolving_power: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Instrument resolving power R = m/FWHM; each stick at mass m is "
+            "broadened with FWHM = m/R"
+        ),
+        examples=[100000],
+    )
+    mass_step: float = Field(
+        ...,
+        gt=0,
+        description="Uniform output-grid spacing in Da (must be > 0)",
+        examples=[0.001],
+    )
+    mass_min: float | None = Field(
+        None,
+        gt=0,
+        description=(
+            "Inclusive lower grid bound in Da; defaults to the smallest "
+            "mass covered by any stick's +/-4 sigma kernel"
+        ),
+    )
+    mass_max: float | None = Field(
+        None,
+        gt=0,
+        description=(
+            "Inclusive upper grid bound in Da; defaults to the largest mass "
+            "covered by any stick's +/-4 sigma kernel"
+        ),
+    )
+
+    @field_validator("resolving_power", "mass_step", "mass_min", "mass_max")
+    @classmethod
+    def values_must_be_finite(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("value must be a finite number")
+        return value
+
+
+class NeutralProfilePointOut(BaseModel):
+    mass: float
+    intensity: float
+
+
+class NeutralProfileResponse(BaseModel):
+    formula: str
+    resolving_power: float
+    mass_min: float
+    mass_max: float
+    mass_step: float
+    point_count: int
+    profile: list[NeutralProfilePointOut]
 
 
 class ObservedPeak(BaseModel):
@@ -510,6 +574,22 @@ async def label_combination_error_handler(
     )
 
 
+@app.exception_handler(ProfileParameterError)
+async def profile_parameter_error_handler(
+    request: Request, exc: ProfileParameterError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": exc.error,
+                "message": exc.message,
+                "field": exc.field,
+            }
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "version": __version__}
@@ -602,6 +682,46 @@ def ion_envelope_endpoint(req: IonEnvelopeRequest) -> dict:
     }
     db.log_request(req.formula, req.top_n, ok=True, message="ion envelope computed")
     return result
+
+
+@app.post("/api/v1/neutral-profile", response_model=NeutralProfileResponse)
+def neutral_profile(req: NeutralProfileRequest) -> dict:
+    """Simulate the instrument profile of a neutral-molecule stick envelope.
+
+    The formula is parsed and convolved with the existing natural-abundance
+    envelope machinery (no ``top_n`` truncation), then every stick at mass m
+    is broadened into a Gaussian with FWHM = m/resolving_power and sampled on
+    one uniform grid (spacing ``mass_step``) within +-4 sigma; kernels are
+    clipped to the requested window but keep their in-window contribution.
+    The summed profile is normalised to a peak intensity of 100.
+    """
+    try:
+        parsed = parse_formula(req.formula)
+    except FormulaError as exc:
+        db.log_request(req.formula, None, ok=False, message=exc.message)
+        raise
+
+    env = isotope_envelope(parsed, settings.merge_tolerance, settings.prune_threshold)
+    result = simulate_profile(
+        env,
+        req.resolving_power,
+        req.mass_step,
+        req.mass_min,
+        req.mass_max,
+    )
+    db.log_request(req.formula, None, ok=True, message="neutral profile computed")
+    return {
+        "formula": req.formula,
+        "resolving_power": req.resolving_power,
+        "mass_min": result.mass_min,
+        "mass_max": result.mass_max,
+        "mass_step": result.mass_step,
+        "point_count": result.point_count,
+        "profile": [
+            {"mass": mass, "intensity": round(intensity, 6)}
+            for mass, intensity in result.profile
+        ],
+    }
 
 
 def _build_pairs(
