@@ -30,6 +30,7 @@ from .identify import IonCandidatePrediction, predict_ion_candidate, score_ion_c
 from .isotopes import ISOTOPES
 from .mixture import fit_ion_mixture, score_mixture
 from .parser import FormulaError, LabelError, parse_formula, parse_label
+from .profile import ProfileError, simulate_profile
 
 
 @asynccontextmanager
@@ -50,8 +51,10 @@ app = FastAPI(
         "formulas, with optional pure-isotope labels such as [13C]; also "
         "estimates single-isotope enrichment by fitting candidate "
         "abundances against observed peaks, jointly fits two isotopes of "
-        "different elements on a 2-D abundance grid, and fits pairwise "
-        "0-100% mixtures of candidate adduct/charge ion envelopes."
+        "different elements on a 2-D abundance grid, fits pairwise "
+        "0-100% mixtures of candidate adduct/charge ion envelopes, and "
+        "simulates Gaussian instrument profiles of the neutral isotope "
+        "stick spectrum at a given resolving power."
     ),
     lifespan=lifespan,
 )
@@ -85,6 +88,60 @@ class EnvelopeResponse(BaseModel):
     peak_count: int
     peaks: list[PeakOut]
     cached: bool
+
+
+class ProfileRequest(BaseModel):
+    formula: str = Field(
+        ...,
+        description="Neutral molecular formula, e.g. 'C6H12O6' or 'C6H6[13C]2'",
+        examples=["C6H12O6"],
+    )
+    resolving_power: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Instrument resolving power R; the Gaussian kernel of a stick at "
+            "mass m has FWHM = m / R"
+        ),
+        examples=[60000],
+    )
+    mass_step: float = Field(
+        ...,
+        gt=0,
+        description="Uniform mass-grid step (Da)",
+        examples=[0.0005],
+    )
+    mass_min: float | None = Field(
+        None,
+        description=(
+            "Lower grid bound (Da); defaults to the lowest stick's -4-sigma "
+            "kernel boundary"
+        ),
+    )
+    mass_max: float | None = Field(
+        None,
+        description=(
+            "Upper grid bound (Da); defaults to the highest stick's +4-sigma "
+            "kernel boundary"
+        ),
+    )
+
+
+class ProfilePointOut(BaseModel):
+    mass: float
+    intensity: float
+
+
+class ProfileResponse(BaseModel):
+    formula: str
+    composition: dict[str, int]
+    labels: dict[str, int]
+    resolving_power: float
+    mass_step: float
+    mass_min: float
+    mass_max: float
+    point_count: int
+    profile: list[ProfilePointOut]
 
 
 class IonEnvelopeRequest(BaseModel):
@@ -510,6 +567,20 @@ async def label_combination_error_handler(
     )
 
 
+@app.exception_handler(ProfileError)
+async def profile_error_handler(request: Request, exc: ProfileError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": "invalid_profile",
+                "message": exc.message,
+                "field": exc.field,
+            }
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "version": __version__}
@@ -555,6 +626,53 @@ def envelope(req: EnvelopeRequest) -> dict:
     db.put_cache(req.formula, req.top_n, {k: v for k, v in result.items() if k != "cached"})
     db.log_request(req.formula, req.top_n, ok=True, message="computed")
     return result
+
+
+@app.post("/api/v1/profile", response_model=ProfileResponse)
+def profile(req: ProfileRequest) -> dict:
+    """Simulate the instrument profile of the neutral isotope stick spectrum.
+
+    The full isotope envelope (no ``top_n`` truncation) is broadened stick
+    by stick with a Gaussian kernel whose FWHM is ``mass / resolving_power``,
+    accumulated on a uniform mass grid within +/-4 sigma of each stick.
+    Kernels are truncated at the grid bounds without renormalisation and
+    the profile is normalised to a maximum intensity of 100. Omitted range
+    bounds default to the outermost +/-4-sigma boundaries over all sticks.
+    """
+    try:
+        parsed = parse_formula(req.formula)
+        result = simulate_profile(
+            parsed,
+            resolving_power=req.resolving_power,
+            mass_step=req.mass_step,
+            mass_min=req.mass_min,
+            mass_max=req.mass_max,
+            merge_tolerance=settings.merge_tolerance,
+            prune=settings.prune_threshold,
+            max_points=settings.profile_max_points,
+        )
+    except (FormulaError, ProfileError) as exc:
+        db.log_request(req.formula, None, ok=False, message=exc.message)
+        raise
+
+    db.log_request(req.formula, None, ok=True, message="profile computed")
+    return {
+        "formula": req.formula,
+        "composition": parsed.composition,
+        "labels": {
+            f"[{mass_no}{symbol}]": count
+            for (symbol, mass_no), count in parsed.labels.items()
+        },
+        "resolving_power": req.resolving_power,
+        "mass_step": req.mass_step,
+        "mass_min": round(result.mass_min, 6),
+        "mass_max": round(result.mass_max, 6),
+        "point_count": len(result.points),
+        "profile": [
+            {"mass": round(m, 6), "intensity": round(i, 6)}
+            for m, i in result.points
+        ],
+    }
 
 
 @app.post("/api/v1/ion-envelope", response_model=IonEnvelopeResponse)

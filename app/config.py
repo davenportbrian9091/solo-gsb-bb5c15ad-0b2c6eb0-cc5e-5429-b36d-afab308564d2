@@ -20,6 +20,8 @@ class Settings:
         self.top_n_max: int = int(os.getenv("MSPC_TOP_N_MAX", "200"))
         # Default number of peaks returned when top_n is not given.
         self.top_n_default: int = int(os.getenv("MSPC_TOP_N_DEFAULT", "20"))
+        # Upper bound for the instrument-profile mass-grid size.
+        self.profile_max_points: int = int(os.getenv("MSPC_PROFILE_MAX_POINTS", "20000"))
 
 
 settings = Settings()

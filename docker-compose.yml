@@ -13,6 +13,7 @@ services:
       # MSPC_PRUNE_THRESHOLD: "1e-12"
       # MSPC_TOP_N_MAX: "200"
       # MSPC_TOP_N_DEFAULT: "20"
+      # MSPC_PROFILE_MAX_POINTS: "20000"
     volumes:
       - mspc-data:/data
     restart: unless-stopped
